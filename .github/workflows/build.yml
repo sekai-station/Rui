@@ -1,0 +1,83 @@
+name: Build devcontainer image
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.devcontainer/**'
+      - '.github/workflows/build.yml'
+  pull_request:
+    paths:
+      - '.devcontainer/**'
+      - '.github/workflows/build.yml'
+  workflow_dispatch:
+  schedule:
+    - cron: '0 2 1 * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: devcontainer-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build and verify tools as vscode
+        uses: devcontainers/ci@v0.3
+        with:
+          imageName: ghcr.io/sekai-station/rui
+          imageTag: latest
+          push: never
+          noCache: true
+          runCmd: |
+            set -eu
+            test "$(id -un)" = vscode
+            go version
+            gopls version
+            dlv version
+            node --version
+            npm --version
+            uv --version
+            fish --version
+
+      - name: Publish to GHCR
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IMAGE: ghcr.io/sekai-station/rui
+        run: |
+          set -eu
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker push "$IMAGE:latest"
+          echo "### Dev Container image" >> "$GITHUB_STEP_SUMMARY"
+          echo "Published \`$IMAGE:latest\` (linux/amd64)." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep only the latest package version
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          endpoint="/orgs/sekai-station/packages/container/rui/versions"
+          versions=$(gh api --paginate --slurp "$endpoint?per_page=100" | jq 'add')
+          latest=$(jq '[.[] | select(.metadata.container.tags | index("latest"))]' <<< "$versions")
+          if [ "$(jq 'length' <<< "$latest")" -ne 1 ]; then
+            echo "Expected exactly one version tagged latest; refusing to delete anything."
+            exit 1
+          fi
+          keep_id=$(jq -r '.[0].id' <<< "$latest")
+          while IFS= read -r version_id; do
+            gh api --method DELETE "$endpoint/$version_id"
+          done < <(jq -r --argjson keep "$keep_id" '.[] | select(.id != $keep) | .id' <<< "$versions")
+          remaining=$(gh api --paginate --slurp "$endpoint?per_page=100" | jq 'add')
+          jq -e --argjson keep "$keep_id" 'length == 1 and .[0].id == $keep and (.[0].metadata.container.tags | index("latest") != null)' <<< "$remaining" > /dev/null
+          echo "Retained only package version $keep_id (latest)." >> "$GITHUB_STEP_SUMMARY"
